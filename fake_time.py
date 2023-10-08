@@ -36,3 +36,6 @@ class fakeTimer:
         with self.__fake_timer_lock:
             result = self.__i_time
         return result
+    def set_time(self, new_time:int):
+        with self.__fake_timer_lock:
+            self.__i_time = new_time
