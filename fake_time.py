@@ -15,7 +15,6 @@ class fakeTimer:
                     self.__i_time += 1
                 else:
                     break
-                
         return
 
     def start_timer(self):

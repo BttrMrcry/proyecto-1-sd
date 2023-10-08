@@ -13,8 +13,8 @@ class RequestElements(Enum):
 
 class SyncServer:
     def __init__(self, port: int = 8000, host:str = ''):
-        self.timer = fakeTimer()
-        self.timer.start_timer()
+        self.__timer = fakeTimer()
+        self.__timer.start_timer()
         self.__port = port
         self.__host = host
         self.__print_lock = Lock()
@@ -29,7 +29,7 @@ class SyncServer:
                 print('The request format is incorrect')
             return
         response_message = {
-            ResponseElemens.TIME.value: self.timer.get_time()
+            ResponseElemens.TIME.value: self.__timer.get_time()
         }
         str_message = json.dumps(response_message, indent=4)
         time.sleep(intentional_delay)
@@ -79,15 +79,14 @@ class SyncClient:
                 print('The server response format is incorrect')
             return
         
-        latency = sending_time - response_time
+        latency = response_time - sending_time
         new_time = server_time + latency // 2
         self.timer.set_time(new_time)
         with self.__print_lock:
-            print(f'Previous time: {response_time} -> New time: {new_time}')
+            print(f'Previous time: {response_time} -> New time: {new_time}. The one way travel time was: {latency // 2}')
         s.close()
 
     def update_time_periodicaly(self, period: int, intentional_delay: int = 0):
         while True:
             self.__update_time(intentional_delay)
             time.sleep(period)
-    
