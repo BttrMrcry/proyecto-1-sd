@@ -1,11 +1,12 @@
 import time
 from threading import Thread, Lock
 
+
 class fakeTimer:
     def __init__(self):
-        self.__should_timer_run:bool = False
-        self.__i_time:int = 0
-        self.__fake_timer_lock:Lock = Lock()
+        self.__should_timer_run = False
+        self.__i_time = 0
+        self.__fake_timer_lock = Lock()
     
     def __run_timer(self):
         while True:
@@ -23,7 +24,7 @@ class fakeTimer:
                 print("timer already running")
             else:
               self.__should_timer_run = True
-        t:Thread = Thread(target= self.__run_timer, name = 'Timer_counter', args=())
+        t = Thread(target= self.__run_timer, name = 'Timer_counter', args=())
         t.start()
     
     def stop_timer(self):
