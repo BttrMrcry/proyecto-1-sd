@@ -5,21 +5,29 @@ from threading import Thread, Lock
 from enum import Enum
 from fake_time import fakeTimer
 
-## solicitud de subscripción
-## Solicitud al cliente de su tiempo
-## envio de la corrrección de tiempo
-
-
 MAX_SELECTION_DIFFERENCE = 500
 
+class MessageAtributes(Enum):
+    TYPE = 'type'
+    DATA = 'data'
 
-class MessageType(Enum):
+class MessageTypes(Enum):
     TIME_RESPONSE = 'time_response'
+    ENROLLMENT_REQUEST = 'enrollment'
     CORRECTION = 'correction'
     TIME_REQUEST = 'time_request'
 
+class TimeResponseData(Enum):
+    TIME = 'time'
+class TimeCorrectionData(Enum):
+    CORRECTION = 'correction'
+
+class EnrollmentRequestData(Enum):
+    INTENTIONAL_DELAY = 'delay'
+
+
 class SyncServer:
-    def __init__(self, port: int = 8000, host:str = ''):
+    def __init__(self, port: int = 8000, host:str = '', timeout:int = 1):
         self.__timer = fakeTimer()
         self.__timer.start_timer()
         self.__port = port
@@ -27,136 +35,226 @@ class SyncServer:
         self.__print_lock = Lock()
         self.__client_sockets = list[dict]()
         self.__client_list_lock = Lock()
+        self.__timeout = timeout
 
     def __listen_for_client(self, server_socket: socket.socket):
         while True:
-            # accepting a client / slave clock client
+            # accepting a client
             client_connector, addr = server_socket.accept()
-            client_address = str(addr[0]) + ":" + str(addr[1])
-            print(client_address + " got connected successfully")
+            str_message = client_connector.recv(1024).decode()
+            message = json.loads(str_message)
+            intentional_delay = 0
+            try:
+                if message[MessageAtributes.TYPE.value] == MessageTypes.ENROLLMENT_REQUEST.value:
+                    intentional_delay = message[MessageAtributes.DATA.value][EnrollmentRequestData.INTENTIONAL_DELAY.value]
+                else:
+                    with self.__print_lock:
+                        print(f'Bad enrollment request from {addr}')
+                    client_connector.close()
+                    continue
+            except:
+                with self.__print_lock:
+                    print(f'Bad enrollment request from {addr}')
+                client_connector.close()
+                continue
+            
+            client_connector.settimeout(self.__timeout)
+            
             with self.__client_list_lock:
                 self.__client_sockets.append(
                     {
                         'socket': client_connector,
                         'time': 0,
-                        'still_active': True
+                        'still_active': True,
+                        'intentional_delay': intentional_delay,
+                        'address': addr,
+                        'one_way_trip': 0
                     }
                 )
+            with self.__print_lock:
+                print(f'{addr} is now in the syncronization list')
     
-    def __request_time(self, socket: socket.socket, intentional_delay: int = 0):
-        socket.send(MessageType.TIME_REQUEST.value.encode())
-
-    def __send_time(self, socket: socket.socket, message: str, intentional_delay: int = 0):
-        socket.send(message.encode())
-    def __syncronize(self, intentional_delay: int = 0):
-        with self.__client_list_lock:
-            for client in self.__client_sockets:
-                t = Thread(target=self.__request_time, args=[client['socket'], intentional_delay])
-                t.start()
-        time.sleep(1)
-        with self.__client_list_lock:
-            for client in self.__client_sockets:
-                str_answer = client['socket'].recv(1024).decode()
-                if not str_answer:
-                    client['still_active'] = False
-                    continue
-                else:
-                    answer = json.loads(str_answer)
-                    received_time = 0
-                    try:
-                        receibed_time = answer[MessageType.TIME_RESPONSE.value]
-                    except:
-                        client['still_active'] = False
-                        continue
-                    client['time'] = received_time
-        still_connected = list()
-        with self.__client_list_lock:
-            still_connected:list[dict] = list(filter(lambda x: x['still_active'] == True, self.__client_sockets))
-        current_server_time = self.__timer.get_time()
-        valid_for_avg = list(filter(lambda x: abs(x['time'] - current_server_time) < MAX_SELECTION_DIFFERENCE, still_connected))
-        sum_time = sum([client['time'] for client in valid_for_avg]) + current_server_time
-        avg_time = sum_time//(len(valid_for_avg) + 1)
-
+    def __request_time(self, client: dict):
+        message = {
+            MessageAtributes.TYPE.value: MessageTypes.TIME_REQUEST.value
+        }
+        str_message = json.dumps(message)
+        time.sleep(client['intentional_delay'])
+        try:
+            client['socket'].send(str_message.encode())
+        except:
+            client['still_active'] = False
         
-        for client in still_connected:
-            correction = avg_time - client['time']
-            message = {
-                MessageType.CORRECTION.value: correction
+    def __receive_time(self, client: dict, start_time: int):
+        end_time = 0
+        try:
+            str_answer = client['socket'].recv(1024).decode()
+            end_time = self.__timer.get_time()
+        except:
+            client['still_active'] = False
+            return
+    
+        answer = json.loads(str_answer)
+        received_time = 0
+        try:
+            if answer[MessageAtributes.TYPE.value] == MessageTypes.TIME_RESPONSE.value:
+                received_time = answer[MessageAtributes.DATA.value][TimeResponseData.TIME.value]
+        except:
+            client['still_active'] = False
+            return
+        one_way_trip = (end_time - start_time) // 2
+        server_time = self.__timer.get_time() 
+        client['time'] = (received_time + one_way_trip) - server_time
+        client['one_way_trip'] = one_way_trip
+    
+    def __send_correction(self, client: dict, correction: int):
+        message = {
+            MessageAtributes.TYPE.value: MessageTypes.CORRECTION.value,
+            MessageAtributes.DATA.value: {
+                TimeCorrectionData.CORRECTION.value: correction
             }
-            str_message = json.dumps(message)
-            t = Thread(target=self.__send_time, args=[client['socket'], str_message, intentional_delay])
-            t.start()
+        }
+        str_message = json.dumps(message)
+        time.sleep(client['intentional_delay'])
+        client['socket'].send(str_message.encode())
+    
+    def __syncronize(self):
+        with self.__print_lock:
+            print('starting sync round')
+        with self.__client_list_lock:
+            start_time_request = self.__timer.get_time()
+            for client in self.__client_sockets:
+                t = Thread(target= self.__request_time, args = (client,))
+                t.start()
+            threads = [Thread(target = self.__receive_time, args=(client, start_time_request))  for client in self.__client_sockets]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            #If we do not receive a response we mark the sockets as inactive
+            still_connected:list[dict] = list(filter(lambda x: x['still_active'] == True, self.__client_sockets))
+            valid_for_avg = list(filter(lambda x: abs(x['time']) < MAX_SELECTION_DIFFERENCE, still_connected))
+            
+            if not valid_for_avg:
+                avg_difference = 0
+            else:
+                sum_time = sum([client['time'] for client in valid_for_avg])
+                avg_difference = sum_time//(len(valid_for_avg) + 1)
+            
+            
+            for client in still_connected:
+                correction = -client['time'] + avg_difference
+                t = Thread(target=self.__send_correction, args=(client, avg_difference + correction))
+                t.start()
+            
+            self.__timer.set_time(self.__timer.get_time() + avg_difference)
+            #Cleaning of socket list
+            disconnected:list[dict] = list(filter(lambda x: x['still_active'] == False, self.__client_sockets))
+            #update socket list to only responsive sockets
+            self.__client_sockets = still_connected
+            #close connection with unresponsive clients
+            
+            with self.__print_lock:
+                print(f'{len(disconnected)} were dropped')
+                print(f'{len(still_connected)} were syncronized')
+                for client in disconnected:
+                    print(f'{client["address"]} did not respond and was dropped from the sync list')
+                    client['socket'].close()
+                for client in still_connected:
+                    print(f'client {client["address"]} received time: {client["time"]}. One way trip: {client["one_way_trip"]}')
+    
 
-        
     def start_server(self):
         s = socket.socket()
-        print('socket created')
+        with self.__print_lock:
+            print('socket created')
         s.bind((self.__host, self.__port))
         s.listen(5)
-        print('socket is listening...')
+        with self.__print_lock:
+            print('socket is listening...')
         #wait for conections
-        t = Thread(target=self.__listen_for_client, name='listening thread', args=[s])
-        t.start()  
-
-    def update_time_periodicaly(self, period:int = 60, intentional_delay:int = 0):
+        listener = Thread(target=self.__listen_for_client, name='listening thread', args=[s])
+        listener.start()  
+        #update clients time periodically
+        updater = Thread(target = self.__update_time_periodicaly, args = ())
+        updater.start()
+    
+    def __update_time_periodicaly(self, period:int = 60, intentional_delay:int = 0):
         while True:
-            self.__syncronize(intentional_delay=intentional_delay)
+            self.__syncronize()
             time.sleep(period)
 
 class SyncClient:
-    def __init__(self, port: int = 8000, host:str = '127.0.0.1'):
+    def __init__(self, port: int = 8000, host:str = '127.0.0.1', intentional_delay:int = 0):
         self.timer = fakeTimer()
         self.timer.start_timer()
         self.__print_lock = Lock()
         self.__port = port
         self.__host = host
+        self.__intentional_delay = intentional_delay
+
+    def start_syncronizing(self):
+        listener = Thread(target=self.__listen_for_message, args=())
+        listener.start()
 
     def __enroll_to_server(self):
         self.__socket = socket.socket()
-        print('socket created')
+        with self.__print_lock:
+            print('socket created')
+        time.sleep(self.__intentional_delay)
         self.__socket.connect((self.__host, self.__port))
+        message = {
+            MessageAtributes.TYPE.value: MessageTypes.ENROLLMENT_REQUEST.value,
+            MessageAtributes.DATA.value: {
+                EnrollmentRequestData.INTENTIONAL_DELAY.value: self.__intentional_delay
+            }
+        }
+        str_message = json.dumps(message)
+        self.__socket.send(str_message.encode())
+        with self.__print_lock:
+            print('Connected to server')
    
     def __send_time(self):
+            cur_time = self.timer.get_time()
             message = {
-                MessageType.TIME_RESPONSE
+                MessageAtributes.TYPE.value: MessageTypes.TIME_RESPONSE.value,
+                MessageAtributes.DATA.value: {
+                    TimeResponseData.TIME.value: cur_time
+                }
             }
-    def __listen_for_updates(self):
+            str_message = json.dumps(message)
+            time.sleep(self.__intentional_delay)
+            self.__socket.send(str_message.encode())
+            with self.__print_lock:
+                print(f'Time {cur_time} was send to the server')
+
+    def __fix_time(self, message: dict):
+        old_time = self.timer.get_time()
+        correction = message[MessageAtributes.DATA.value][TimeCorrectionData.CORRECTION.value]
+        new_time = old_time + correction
+        self.timer.set_time(new_time)
+        with self.__print_lock:
+            print(f'Correction received from server. Old time: {old_time} -> New time: {new_time}. Correction: {correction}')
+
+    def __listen_for_message(self):
+        self.__enroll_to_server()
         while True:
             request = self.__socket.recv(1024).decode()
             if not request:
-                continue
-            else:
-                message = json.loads(request)
-                try:
-                    message[MessageType.TIME_REQUEST.value]
-                except:
-                    continue
+                print('Something is wrong with the connection')
+                return 
             
-    
-    def __update_time(self, intentional_delay: int = 0):
-        s = socket.socket()
-        print('socket created')
-        s.connect((self.__host, self.__port))
-        request_message = {
-            RequestElements.INTENTIONAL_DELAY.value: intentional_delay
-        } 
-        str_message = json.dumps(request_message)
-        sending_time = self.timer.get_time()
-        time.sleep(intentional_delay)
-        s.send(str_message.encode())
-        server_message:dict[str, int] = json.loads(s.recv(1024).decode())
-        response_time = self.timer.get_time()
-        server_time = 0
-        try:
-            server_time = server_message[ResponseElemens.TIME.value]
-        except:
-            with self.__print_lock:
-                print('The server response format is incorrect')
-            return
+            message = json.loads(request)
+            try:
+                message_type = message[MessageAtributes.TYPE.value]
+            except:
+                print('Something is wring with the connection')
+                return
+            
+            match message_type:
+                case MessageTypes.TIME_REQUEST.value:
+                    t = Thread(target=self.__send_time(), args=())
+                    t.start()
+                case MessageTypes.CORRECTION.value:
+                    self.__fix_time(message)
         
-        latency = response_time - sending_time
-        new_time = server_time + latency // 2
-        self.timer.set_time(new_time)
-        with self.__print_lock:
-            print(f'Previous time: {response_time} -> New time: {new_time}. The one way travel time was: {latency // 2}')
-        s.close()
