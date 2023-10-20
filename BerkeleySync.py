@@ -16,14 +16,19 @@ class MessageTypes(Enum):
     ENROLLMENT_REQUEST = 'enrollment'
     CORRECTION = 'correction'
     TIME_REQUEST = 'time_request'
+    LIST_UPDATE = 'list_update'
 
 class TimeResponseData(Enum):
     TIME = 'time'
+
 class TimeCorrectionData(Enum):
     CORRECTION = 'correction'
 
 class EnrollmentRequestData(Enum):
     INTENTIONAL_DELAY = 'delay'
+
+class UpdateCurrentClientList(Enum):
+    UPDATE_CLIENT_LIST = 'update_client_list'
 
 
 class SyncServer:
@@ -36,6 +41,7 @@ class SyncServer:
         self.__client_sockets = list[dict]()
         self.__client_list_lock = Lock()
         self.__timeout = timeout
+        self.__current_client_list = list[dict]()
 
     def __listen_for_client(self, server_socket: socket.socket):
         while True:
@@ -71,6 +77,7 @@ class SyncServer:
                         'one_way_trip': 0
                     }
                 )
+                self.__update_current_client_list()
             with self.__print_lock:
                 print(f'{addr} is now in the syncronization list')
     
@@ -153,6 +160,7 @@ class SyncServer:
             #update socket list to only responsive sockets
             self.__client_sockets = still_connected
             #close connection with unresponsive clients
+            self.__update_current_client_list()
             
             with self.__print_lock:
                 print(f'{len(disconnected)} were dropped')
@@ -183,6 +191,28 @@ class SyncServer:
         while True:
             self.__syncronize()
             time.sleep(period)
+    
+    def __update_current_client_list(self):
+        self.__current_client_list.clear
+        for client in self.__client_sockets:
+            self.__current_client_list.append(
+                {
+                    'socket' : client['socket'].getsockname()[1],
+                    'address' : client['address']
+                }
+            )
+
+        message = {
+            MessageAtributes.TYPE.value: MessageTypes.LIST_UPDATE.value,
+            MessageAtributes.DATA.value: {
+                UpdateCurrentClientList.UPDATE_CLIENT_LIST.value : self.__current_client_list
+            }
+        }
+        str_message = json.dumps(message)
+
+        for client in self.__client_sockets:
+            client['socket'].send(str_message.encode())
+
 
 class SyncClient:
     def __init__(self, port: int = 8000, host:str = '127.0.0.1', intentional_delay:int = 0):
@@ -192,10 +222,24 @@ class SyncClient:
         self.__port = port
         self.__host = host
         self.__intentional_delay = intentional_delay
+        self.__client_list = list[dict]()
+        self.__my_port : int
+        self.__my_host : str
 
     def start_syncronizing(self):
         listener = Thread(target=self.__listen_for_message, args=())
         listener.start()
+        while len(self.__client_list) > 0:
+            client = self.__client_list.pop(0)
+            if client['socket'] == self.__my_port and client['address'] == self.__my_host:
+                return [self.__my_port, self.__my_host]
+            else:
+                time.sleep(60)
+                self.__port = client['socket']
+                self.__host = client['address']
+                newListener = Thread(target=self.__listen_for_message, args=())
+                newListener.start()
+
 
     def __enroll_to_server(self):
         self.__socket = socket.socket()
@@ -211,8 +255,11 @@ class SyncClient:
         }
         str_message = json.dumps(message)
         self.__socket.send(str_message.encode())
+        self.__my_host = self.__socket.getsockname()[0]
+        self.__my_port = self.__socket.getsockname()[1]
         with self.__print_lock:
             print('Connected to server')
+
    
     def __send_time(self):
             cur_time = self.timer.get_time()
@@ -236,9 +283,14 @@ class SyncClient:
         with self.__print_lock:
             print(f'Correction received from server. Old time: {old_time} -> New time: {new_time}. Correction: {correction}')
 
+    def __update_client_list(self, message: dict):
+        self.__client_list = message[MessageAtributes.DATA.value][UpdateCurrentClientList.UPDATE_CLIENT_LIST.value]
+
+
     def __listen_for_message(self):
         self.__enroll_to_server()
-        while True:
+        timeout = time.time() + 90
+        while time.time() > timeout:
             request = self.__socket.recv(1024).decode()
             if not request:
                 print('Something is wrong with the connection')
@@ -255,6 +307,12 @@ class SyncClient:
                 case MessageTypes.TIME_REQUEST.value:
                     t = Thread(target=self.__send_time(), args=())
                     t.start()
+                    timeout = time.time() + 90
                 case MessageTypes.CORRECTION.value:
                     self.__fix_time(message)
+                    timeout = time.time() + 90
+                case MessageTypes.LIST_UPDATE.value:
+                    self.__update_client_list(message)
+                    timeout = time.time() + 90
         
+

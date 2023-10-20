@@ -1,5 +1,10 @@
-from BerkeleySync import SyncClient
+from BerkeleySync import SyncClient, SyncServer
 
 if __name__ == '__main__':
     client = SyncClient()
-    client.start_syncronizing()
+    newServerInfo = client.start_syncronizing()
+    if newServerInfo != None:
+        server = SyncServer(newServerInfo[0], newServerInfo[1])
+        server.start_server()
+    else:
+        print("Server not find")
